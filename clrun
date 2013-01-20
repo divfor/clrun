@@ -1,0 +1,613 @@
+#!/bin/sh
+#Test_name number next_hop proxy proxy_option dns_spoofer
+#test_name=${1:-"`basename $PWD`"}
+test_name=${1:-"sfile"}
+#The number of client to simulate
+client_number=${2:-"10000"}
+#Proxy, Gateway or internal IWS/Web/FTP server
+client_next_hop=${3:-"10.231.8.198"}
+#String "none" for no proxy, <ip> for transparent proxy, <ip:port> for explicit proxy
+proxy_option=${4:-"$client_next_hop:8080"}
+#String "none" for no DNS spoofing, <bind_server_ip> for DNS spoofing
+dns_spoofer=${5:-"none"}
+
+#YOU MUST EDIT BELOW PER YOU TEST
+#ip address, sperated by space
+iws_list="none"
+#hostnames, sperated by space
+dns_spoof_exclude="download.websense.com"
+
+cat_cl_conf(){ #$1:name $2:number $3:loading_if $4:netmask $5:ipmin $6:ipmax $7:start $8:inc
+  cat 2>/dev/null >${1}.conf <<EOL
+BATCH_NAME=$1
+CLIENTS_NUM_MAX=$2
+INTERFACE=$3
+NETMASK=$4
+IP_ADDR_MIN=$5
+IP_ADDR_MAX=$6
+#IP_SHARED_NUM=1
+CLIENTS_NUM_START=$7
+CLIENTS_RAMPUP_INC=$8
+CYCLES_NUM=-1
+URLS_NUM=1
+#
+URL_TEMPLATE=%s
+URL_TOKEN_FILE=${1}.urls
+REQUEST_TYPE=GET
+TIMER_URL_COMPLETION=1200000
+TIMER_AFTER_URL_SLEEP=0
+#PROXY_AUTH_METHOD="NTLM"
+#PROXY_AUTH_CREDENTIALS="wcg\Administrator:firewall"
+#
+#URL="http://wcg_ip:8083/synthetic.txt"
+#URL_SHORT_NAME="content_cop_monitor"
+#REQUEST_TYPE=GET
+#TIMER_URL_COMPLETION=4000
+#TIMER_AFTER_URL_SLEEP=6000
+EOL
+}
+errtrap(){ echo "Error in `caller`, exiting... Please report to Fred Huang." 1>&2; }
+#trap 'errtrap' ERR
+log(){ [ -n "$debug" ] && echo "$1"; }
+err_return(){ echo "$1" >&2; return 1; }
+err_exit(){ echo "$1" >&2; exit 1; }
+
+usage(){
+  local cmd=`basename $0`;
+  echo "Usage: $cmd set-sshd | set_named | set-httpd | set-url | test_name  parameter(s)"
+  echo "--- Steps ----"
+  echo "setup 1, set-sshd to put public key to related hosts for non-password ssh access;"
+  echo "setup 2, set-bind to add iws IPs to bind server for dns spoofing with round-robin;"
+  echo "setup 3, set-docs to upload content folders to document root in iws apache server;"
+  echo "setup 4, set-urls to retrieve URL lists form given files (via http/https/ftp/scp) to \$test_name.urls;"
+  echo "RunTest: test_name client_num client_next_hop proxy[:port] dns_spoofer"
+  echo "   Note: setup 1~4 are optional per your test. Make sure \$test_name.urls is availible before test run."
+  echo
+  echo "--- Examples ----
+  $cmd set-sshd \$wcg \$dns_server \$iws1 \$iws2 \$iws3
+  $cmd set-bind \$dns_server \$iws1 \$iws2 \$iws3
+  $cmd set-docs \$iws1 \"/root/data/text_dir\" \"./media_dir\" \"./html_pages_dir\"
+  $cmd set-urls \$test_name.urls \"http://\$iws1/a.urls\" \"./url.txt\" \"ftp://\$ftpserver/url.list\"
+"
+  echo "--- Scenarios ----
+  1. no proxy to Internet:
+     -- simuated IPs must use client's subnet with client's default gateway
+        as next_hop
+  2. no proxy to IWS (internal web server):
+     -- simulated IPs can use either client's subnet or private subnet with IWS 
+        (if it's local, otherwise client's default gateway) as next_hop
+  3. proxy and client in same subnet:
+     -- transparent mode, simulated IPs must use a private subnet with proxy
+        as next_hop.
+     -- explicit mode, simulated IPs can use either private subnet or client's
+        subnet with proxy as next_hop.
+  4. proxy and client in different subnets:
+     -- transparent mode, no way.
+     -- explicit mode, simuated IPs must use client's subnet with client's
+        default gateway as next_hop.
+"
+  exit 1
+}
+
+
+#target_dir="${1%/}"
+#url_prefix=${2:-"http://${target_dir##*/}.fred<random>.com/${target_dir##*/}/"}
+#( cd "$target_dir" && find . -type f ) | files_to_urls "$url_prefix"
+files_to_urls(){ # $1:url_prefix [http://dir.fred<random_number>.com/dir]
+  local url_prefix="${1%/}" url_path= file_path=;
+  while read file_path; do
+    url_path="${file_path// /%20}" # change spaces to URL format
+    echo "${url_prefix//<random>/$RANDOM}/${url_path#./}"
+  done | sort
+}
+
+add_url_to_list(){ #$1:list_file_name $2:url_file
+  local list="$1"; local fn="$2"; local retn=1; [ -n "$fn" ] || return 1;
+  if [ -f "$fn" -a -s "$fn" ]; then
+    cat "$fn" >> "$list" && retn=0 #local path
+  elif echo "$fn" | grep -q '^http://\|^ftp://\|^https://'; then #web url
+    wget --no-check-certificate -qO - "$fn" | cat >> "$list" && retn=0
+  elif [ "2" = $(echo $fn|awk -F: '{print NF}') ]; then #scp path
+    scp "$fn" ./ &>/dev/null && cat `basename "$fn"` 2>/dev/null >>"$list" && retn=0
+  fi
+  if [ "$retn" = "0" ]; then echo "Successfully add URLs from [$fn]" && return 0;
+  else echo "failed to add URLs from [$fn]" && return 1; fi
+}
+
+#Usage: setup_dns_spoofer $@
+setup_dns_spoofer(){ #$1:host_of_named $2-n:iws_list
+ local set_default='
+cat > /var/named/chroot/etc/named.conf <<EOL
+options {
+        directory "/var/named";
+        dump-file "/var/named/data/cache_dump.db";
+        statistics-file "/var/named/data/named_stats.txt";
+        /*
+         * If there is a firewall between you and nameservers you want
+         * to talk to, you might need to uncomment the query-source
+         * directive below.  Previous versions of BIND always asked
+         * questions using port 53, but BIND 8.1 uses an unprivileged
+         * port by default.
+         */
+         // query-source address * port 53;
+         // listen-on port 53 {127.0.0.1;};
+         // forwarders {10.226.0.10;10.32.8.10;};
+         // forward only;
+};
+
+zone "." IN {
+        type master; //hint
+        file "named.root";
+};
+
+zone "localdomain." IN {
+        type master;
+        file "localdomain.zone";
+        allow-update { none; };
+};
+
+zone "localhost." IN {
+        type master;
+        file "localhost.zone";
+        allow-update { none; };
+};
+
+zone "0.0.127.in-addr.arpa." IN {
+        type master;
+        file "named.local";
+        allow-update { none; };
+};
+
+zone "0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa." IN {
+        type master;
+        file "named.ip6.local";
+        allow-update { none; };
+};
+
+zone "255.in-addr.arpa." IN {
+        type master;
+        file "named.broadcast";
+        allow-update { none; };
+};
+
+zone "0.in-addr.arpa." IN {
+        type master;
+        file "named.zero";
+        allow-update { none; };
+};
+
+include "/etc/rndc.key";
+EOL
+cat > /var/named/chroot/var/named/named.root <<EOL
+\$TTL    86400
+@               IN SOA  localhost root (
+                                        42              ; serial (d. adams)
+                                        3H              ; refresh
+                                        15M             ; retry
+                                        1W              ; expiry
+                                        1D )            ; minimum
+        IN NS localhost.
+EOL
+'
+  local pkgs="bind bind-chroot caching-nameserver bind-libs bind-utils"
+  local db="/var/named/chroot/var/named/named.root"
+  local cfg="/var/named/chroot/etc/named.conf"
+  local cmd=; local ns="$1" && shift;
+  cmd="n=0; for i in $pkgs; do rpm --quiet -q \$i || { echo \$i is not installed; n=1; }; done; ((n==0)) || exit 1;"
+  cmd="$cmd for i in $db $cfg; do if [ ! -f \$i.origin ]; then [ -f \$i ] && mv \$i \$i.origin || touch \$i.origin; fi; done; " # backup origin
+  if [ -n "$1" ]; then  # set bind as DSN spoofer with loadbalance among ip addresses of $@
+    cmd="$cmd $set_default" # overwrite named.conf and named.root to above code
+#   cmd="$cmd sed -i 's/type hint;/type master; \/\/hint/g' $cfg; sed -i '/^\*\..*IN A.*/d' $db;"
+    cmd="$cmd for ip in $@; do echo \"*.      IN A \$ip\" >> $db; done;"
+  else # reset bind to original settings
+    cmd="$cmd n=0; for i in $cfg $db; do [ -s \$i.origin ] && cat \$i.origin > \$i && ((n++)); done;"
+    cmd="$cmd if ((n==2)); then echo named.conf and named.root restored from backup; service named restart; exit; fi"
+    cmd="$cmd sed -i 's/type master; \/\/hint/type hint;/g' $cfg 2>/dev/null;"
+  fi
+  cmd="$cmd ip address flush secondary &>/dev/null; service named restart;" 
+  if [ "$ns" = "localhost" ]; then eval "$cmd"; else ssh $ns "$cmd"; fi
+}
+
+install_curl_loader(){
+  which curl-loader &>/dev/null && return 0
+  local ftp_url=${1:-"ftp://10.226.0.11/incoming/testing_tools/curl_loader/curl-loader-0.52.tar.gz"}
+  local dl_url="http://downloads.sourceforge.net/project/curl-loader/curl-loader/curl-loader-0.52/curl-loader-0.52.tar.gz?use_mirror=cdnetworks-kr-2&ts=1280301351"
+  local pkgdir="/root/packages";
+  local pkg=`ls $pkgdir/curl-loader*.tar.gz 2>/dev/null | head -1`
+#  [ -f "$pkg" ] || { mkdir -p $pkgdir && cd $pkgdir 2>/dev/null && wget -q $ftp_url && cd - &>/dev/null; } # try to get it frist form internal ftp site
+  if ! [ -f "$pkg" ]; then
+    echo "Downloading curl-loader from Internet to \"$pkgdir\" ... "
+    mkdir -p $pkgdir && cd $pkgdir && wget "$dl_url" || { echo "Downloading failed, exiting..."; return 1; }; cd - >/dev/null;
+    pkg=`ls $pkgdir/curl-loader*.tar.gz 2>/dev/null | head -1`
+    [ -f "$pkg" ] || { echo "Can not get curl-loader package, exiting..."; return 1; }
+  fi
+  local build=`sed -r 's/.*(curl-loader.*)\.tar\.gz.*/\1/g' <<< $pkg` # like "curl-loader-0.52"
+  cd $pkgdir; rm -rf $build; tar zxf $pkg &>/dev/null; cd - >/dev/null; cd $pkgdir/$build
+  echo -n "Building curl-loader ... "; make optimize=1 debug=0 &>/dev/null || { echo "failed."; return 1;  }; echo "done."
+  echo -n "Installing curl-loader ... "; make install &>/dev/null || { echo "failed."; return 1; }; echo "done."
+  cd - >/dev/null
+  which curl-loader &>/dev/null || { echo "Still not have \"curl-loader\" installed, exit."; return 1; }
+  return 0
+}
+
+tune_loading_system(){ #$1:loading_interface
+  [ -n "$1" ] && ifconfig "$1" &>/dev/null || { echo "No loading interface found."; return 1; }
+  echo 0 > /proc/sys/net/ipv4/conf/$1/rp_filter
+  echo 0 > /proc/sys/net/ipv4/conf/$1/accept_redirects
+  echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter
+  echo 0 > /proc/sys/net/ipv4/conf/all/accept_redirects
+  ulimit -n 200000
+  echo 2000000   > /proc/sys/fs/file-max                      # default 2417293
+  echo 1         > /proc/sys/net/ipv4/tcp_tw_recycle          # default 0
+  echo 1         > /proc/sys/net/ipv4/tcp_tw_reuse            # default 0
+  echo 1         > /proc/sys/net/ipv4/tcp_window_scaling      # default 1
+  echo 5         > /proc/sys/net/ipv4/tcp_fin_timeout         # default 60
+  echo 1200      > /proc/sys/net/ipv4/tcp_keepalive_time      # default 7200
+  echo 8192      > /proc/sys/net/ipv4/tcp_max_syn_backlog     # default 1024
+  echo 2000      > /proc/sys/net/ipv4/tcp_max_tw_buckets      # default 180000
+  echo 2048      > /proc/sys/net/core/netdev_max_backlog      # default 1000
+  echo 1024      > /proc/sys/net/core/somaxconn               # default 128
+  echo '10000 61000' > /proc/sys/net/ipv4/ip_local_port_range # default '32768 61000'
+  echo '4096 87380 8388608' > /proc/sys/net/ipv4/tcp_rmem     # default '4096 87380 4194304', 87380->43689 is better for low mem system
+  echo '4096 87380 8388608' > /proc/sys/net/ipv4/tcp_wmem     # default '4096 16384 4194304', be careful
+  echo '8388608' > /proc/sys/net/core/rmem_max                # default 131071, be careful
+  echo '8388608' > /proc/sys/net/core/wmem_max                # default 131071, be careful
+  echo 0         > /proc/sys/net/ipv4/tcp_timestamps          # default 1, disable may lead to huge number of TIME_WAIT
+# echo '196608 262144 393216' > /proc/sys/net/ipv4/tcp_mem    # default '196608 262144 393216'(0.75G 1G 1.5G)/4K for 32bit PAE system
+# echo 1 > /proc/sys/net/ipv4/tcp_rfc1337       # an arriving RST immediately closes TIME_WAIT, default disabled
+# echo 1 > /proc/sys/net/ipv4/tcp_low_latency   # prefer lower latency other than higher throughput, default disabled
+# echo 1 > /proc/sys/net/ipv4/tcp_westwood      # optimize slow start and throughput, default disabled
+# echo '256 256 1' > /proc/sys/vm/lowmem_reserve_ratio # default '256 256 32', protect 100% instead of 1/32 low_mem in 32bit PAE system
+  ip address flush secondary &>/dev/null
+  return 0
+}
+
+gen_local_keys(){ #No parameters needed
+  local kdir="`cd ~;pwd`/.ssh"
+  local pubkey="$kdir/authorized_keys2"
+  local privatekey="$kdir/id_rsa"
+  echo "Generate private-public keys for this machine:"
+  ssh-keygen -q -t rsa -f $kdir/id_rsa
+  if [ $? ]; then echo "Done."; else echo "Failed"; return 1; fi
+  [ -f "$pubkey" ] || touch "$pubkey"
+  sort $kdir/id_rsa.pub $pubkey|uniq>$pubkey.tmp; cat $pubkey.tmp>$pubkey;rm -rf $pubkey.tmp;
+  chmod 700 $kdir; chmod 644 $pubkey; chmod 400 $privatekey;
+  return 0;
+}
+
+sync_ssh_keys(){ #$1: target_host  $2(optional): with_private_key
+  local sshcmd="ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no"
+  local scpcmd="scp -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no"
+  local kdir="$HOME/.ssh";
+  local pubkey="$kdir/authorized_keys2";
+  local privatekey="$kdir/id_rsa";
+  [ -f "$kdir/id_rsa" ] || gen_local_keys || { echo "Failed to create public-private keys"; return 1; }
+  local retn=`cat $pubkey | $sshcmd $1 2>/dev/null "mkdir -p $kdir && chmod 700 $kdir && touch $pubkey; \
+      sort - $pubkey | uniq > $pubkey.tmp; cat $pubkey.tmp > $pubkey; [ -s $pubkey.tmp ] && echo 0; rm -rf $pubkey.tmp"`
+  if [ "X$retn" = "X0" ]; then echo "sync public key [$pubkey] ...... done."; [ -n "$2" ] || return 0;
+  else echo "sync public key [$pubkey] ...... failed at syncing public key."; return 1; fi
+  echo -n "sync private key [$privatekey] ...... ";
+  $scpcmd $privatekey $1:$kdir/ &>/dev/null && echo "done." && return 0;
+  echo "failed at syncing private key." && return 1;
+}
+
+put_dir_to_apache(){ #$1:apache_host $2:local_dir_to_upload_to_apache_docroot
+  [ -n "$1" -a -d "$2" ] || { echo "Not a local directory? [$2]" >&2; return 1; }
+  local retn= httpdconf="/etc/httpd/conf/httpd.conf"
+  local webroot=`ssh $1 2>/dev/null "grep ^DocumentRoot $httpdconf"|awk '{print $NF}'|sed 's/"//g'`
+  [ -n "$webroot" ] || { echo "No apache server installed?" >&2; return 1; }
+  cd "`dirname $2`";
+  retn=`tar zcf - "$(basename $2)"|ssh $1 2>/dev/null "mkdir -p $webroot && cd $webroot && tar zxf - &>/dev/null; echo $?"`
+  cd - &>/dev/null;
+  return $retn;
+}
+
+#Usage: v=$(get_wcg_config "$wcg" 'ab.*cd' || return 1)
+get_wcg_config(){ #$1:wcg_host $2:setting_keyword
+  local wcg="${1:-localhost}"; local kw="$2"; local cmd=; local retn=;
+  local fn="/opt/WCG/config/records.config";
+  cmd="grep '^[^#]' $fn 2>/dev/null | grep '$kw' | awk '{print \$NF}' | head -1;"
+  if [ "$wcg" = "localhost" ]; then retn=`eval "$cmd"`;
+  else retn=`ssh $wcg 2>/dev/null "$cmd"`; fi
+  [ -n "$retn" ] && echo "$retn" && return 0;
+  echo "[$wcg:$fn]: no value found for keyword \"$kw\"" >&2; return 1;
+}
+
+clear_wcg_cache() { #$1:wcg $2:timeout
+  local wcg="$1"; [ -z "$wcg" -o "$wcg" = "none" ] && return 1;
+  get_wcg_config "$wcg" "proxy_name" &>/dev/null || return 1; # return if not WCG proxy
+  ssh $wcg 2>/dev/null "cd /proc/sys/net/ipv4/conf/; echo 0 > all/send_redirects; echo 0 > eth0/send_redirects;"
+  local cmd="/opt/WCG/WCGAdmin"
+  echo -n "[$wcg]: restart WCG to clear DNS cache. [Yes]|No: " && read;
+  case "$REPLY" in Yes|yes|Y|y) echo -n "Clear WCG DNS cache";; *) return 0;; esac
+  ssh -f -T $wcg "nohup $cmd stop &>/dev/null; \
+             nohup /opt/WCG/bin/content_gateway -Cclear &>/dev/null; \
+             nohup $cmd start &>/dev/null;"
+  local timeout=${2:-"180"} nrun=0;
+  echo -n ", please wait (at most ${timeout}s) ... ";
+  local nline=`ssh $wcg 2>/dev/null "[ -f $cmd ] && $cmd status | grep -sc ' is '"`;
+  [ "$nline" = "4" -o "$nline" = "5" ] || { echo "WCG installed not correctly?"; return 1; }
+  for ((nrun=0; timeout>2; timeout-=2)); do
+    sleep 2;
+    nrun=`ssh $wcg 2>/dev/null "[ -f $cmd ] && $cmd status | grep -sc ' is running'"`;
+    [ "$nrun" = "$nline" ] && echo "done." && return 0;
+  done
+  echo "failed to start all WCG services";  return 1; # hit timeout
+}
+
+is_ipv4_address(){ #$1: ip address
+  local i= n=0
+  for i in ${1//./ }; do
+    if ((i>=0 && i<=255)) &>/dev/null; then ((n++)); continue; else break; fi
+  done
+  ((n==4)) && return 0
+  echo "[$(caller)][$FUNCNAME] - invalid IPv4 Address: [$1]" >&2; return 1
+}
+is_ipv4_netmask(){ #$1: netmask like 255.255.248.0 or digits 0~32
+  ((${#1}<3 && $1>=0 && $1<=32)) &>/dev/null && return 0;
+  local i= n=0 j=255
+  for i in ${1//./ }; do
+    if ((i==255||i==0||i==128||i==240||i==192||i==248||i==224||i==252||i==254)) &>/dev/ull && ((j==255 || i==0))
+      then j="$i"; ((++n<4)) && continue; return 0; else break; fi
+  done
+  echo "[$(caller)][$FUNCNAME] - invalid IPv4 NetMask: [$1]" >&2; return 1
+}
+
+is_ipv4_slash_mask(){ #$1: ip/mask like 10.226.0.0/16 or 10.226.0.0/255.255.0.0
+  is_ipv4_address "${1%\/*}" && is_ipv4_netmask "${1#*\/}" && return 0
+  echo "[$(caller)][$FUNCNAME] - invalid 'IPv4/NetMask' format: [$1]" >&2; exit 1
+}
+get_mask_part(){ #$1:ip/mask (10.226.0.0/16 => 16, 10.226.0.0./255.255.0.0 => 255.255.0.0)
+  is_ipv4_slash_mask "$1" && echo "${1#*\/}" && return 0
+}
+get_ip_part(){ #$1:ip/mask (10.226.0.0/16 => 10.226.0.0)
+  is_ipv4_slash_mask "$1" && echo "${1%\/*}" && return 0
+}
+
+get_ipv4_subnet(){ #$1:ip/mask (10.226.0.0/16 => 10.226)
+  is_ipv4_slash_mask "$1" || err_exit "$FUNCNAME: invalid 'ip/mask': [$1]"
+  local arg= i= n=0 mask="${1#*\/}"
+  if ((${#mask}<3 && $mask>=0 && $mask<=32)) &>/dev/null; then
+    for((n=1; mask>8; mask-=8)); do arg="$arg m$((n++))=255"; done
+    arg="$arg m$n=$(((65280>>mask)&255))";
+  else
+    for i in ${mask//./ }; do ((n++)); arg="$arg m$n=$i"; done
+  fi
+  echo "${1%\/*}" | awk -F. '{print and($1,m1)"."and($2,m2)"."and($3,m3)"."and($4,m4)}' $arg
+}
+
+get_net_part(){ #$1:ip/mask (10.226.0.0/16 => 10.226)
+  is_ipv4_slash_mask "$1" || err_exit "wrong ip/mask parameter: [$1]";
+  local mask="${1#*\/}"; local host="${1%\/*}";
+  case "$mask" in
+    0) return 0;;
+    8) echo "${host%.*.*.*}" && return 0;;
+   16) echo "${host%.*.*}" && return 0;;
+   24) echo "${host%.*}" && return 0;;
+   32) echo "$host" && return 0;;
+    *) echo "bad subnet: [$1}" >&2 && return 1;;
+  esac
+}
+client_subnet_by_next_hop(){ #$1:loading_if $2:next_hop
+  ifconfig "$1" &>/dev/null && [ -n "$2" ] || return 1
+  local gw=`ip route|awk '/default via/{print $3}'`
+  local ip=`ifconfig $1|awk '{if(/inet addr:/){print substr($2,6);}}'`
+  if [ "$gw" = "$2" ]; then ip route|awk "/dev $1.*src $ip/{print \$1}" && return 0
+  else echo "192.`echo $ip|awk -F'.' '{print $NF}'`.0.0/16" && return 0; fi
+  return 1;
+}
+client_subnet_from_conf(){ #$1:curl-loader.conf
+  local netmask=`awk -F'=' '/NETMASK/{print $NF}' "$1"`;
+  local ipmin=`awk -F'=' '/IP_ADDR_MIN/{print $NF}' "$1"`;
+  [ "$netmask" = "16" -o "$netmask" = "24" ] && [ -n "$ipmin" ] || return 1;
+  [ "$netmask" = "16" ] && echo "${ipmin%.*.*}.0.0/16" || echo "${ipmin%.*}.0/24";
+  return 0
+}
+get_loading_if(){ #$1:next_hop_ip
+  ip route get $1 | head -1 |  awk '/dev/{while(i<NF)if($(i++)=="dev")print $i}'
+}
+get_loading_ip(){ #$1:next_hop_ip
+  ip route get $1 | head -1 | awk '/src/{print $NF}'
+}
+
+add_host_route(){ #$1:ssh_host $2:ip/mask $2:next_hop
+  local ssh_host="${1:-none}"; [ "$ssh_host" = "none" ] && return 1;
+  local dst="$2"; local next_hop="$3";
+  local mask=$(get_mask_part "$dst" || return 1); [ "$mask" = "32" ] || return 1;
+  local cmd=; local retn=;
+  echo -n "@$ssh_host: route add $dst gw $next_hop ...... "
+  cmd="while route del $dst &>/dev/null; do continue; done; route add $dst gw $next_hop &>/dev/null; echo \$?;"
+  if [ "$ssh_host" = "localhost" ]; then retn=`eval "$cmd"`;
+    else retn=`ssh root@$ssh_host 2>/dev/null "$cmd"`; fi
+  if [ "X$retn" = "X0" ]; then echo "done."; else echo "failed."; fi
+  return $retn;
+}
+del_host_route(){ #$1:ssh_host $2:ip/mask $2:next_hop
+  local ssh_host="${1:-none}"; [ "$ssh_host" = "none" ] && return 1;
+  local dst="$2"; local next_hop="$3";
+  local mask=$(get_mask_part "$dst"); [ "$mask" = "32" ] || return 1;
+  local cmd=; local retn=;
+  echo -n "@$ssh_host: route del $dst ...... "
+  cmd="while route del $dst &>/dev/null; do continue; done; echo \$?;"
+  if [ "$ssh_host" = "localhost" ]; then retn=`eval "$cmd"`;
+    else retn=`ssh root@$ssh_host 2>/dev/null "$cmd"`; fi
+  if [ "X$retn" = "X0" ]; then echo "done."; else echo "failed."; fi
+  return $retn;
+}
+add_net_route(){ #$1:ssh_host $2:ip/mask $2:next_hop
+  local ssh_host="${1:-none}"; [ "$ssh_host" = "none" ] && return 1;
+  local dst="$2"; local next_hop="$3";
+  local net=$(get_net_part "$dst"); [ -n "$net" ] || return 1;
+  local mask=$(get_mask_part "$dst"); [ -n "$mask" -a "$mask" != "32" ] || return 1;
+  [ -n "$net" ] && [[ "$next_hop" =~ "^$net" ]] && return 1;
+# [ -n "$net" ] && echo "$next_hop"|grep -q "$net" && return 1; # dst net is next_hop's subnet (the same as my subnet)
+  local cmd=; local retn=;
+  echo -n "@$ssh_host: route add -net $dst gw $next_hop ...... "
+  cmd="while route del -net $dst &>/dev/null; do continue; done; route add -net $dst gw $next_hop &>/dev/null; echo \$?;"
+  if [ "$ssh_host" = "localhost" ]; then retn=`eval "$cmd"`;
+    else retn=`ssh root@$ssh_host 2>/dev/null "$cmd"`; fi
+  if [ "X$retn" = "X0" ]; then echo "done."; else echo "failed."; fi
+  return $retn;
+}
+del_net_route(){ #$1:ssh_host $2:ip/mask $2:next_hop
+  local ssh_host="${1:-none}"; [ "$ssh_host" = "none" ] && return 1;
+  local dst="$2"; local next_hop="$3";
+  local net=$(get_net_part "$dst");
+  local mask=$(get_mask_part "$dst"); [ "$mask" = "32" ] && return 1;
+  [ -n "$net" ] && [[ "$next_hop" =~ "^$net" ]] && return 1;
+# [ -n "$net" ] && echo "$next_hop"|grep -q "$net" && return 1;
+  local cmd=; local retn=;
+  echo -n "@$ssh_host: route del -net $dst ...... "
+  cmd="while route del -net $dst &>/dev/null; do continue; done; echo \$?;"
+  if [ "$ssh_host" = "localhost" ]; then retn=`eval "$cmd"`;
+    else retn=`ssh root@$ssh_host 2>/dev/null "$cmd"`; fi
+  if [ "X$retn" = "X0" ]; then echo "done."; else echo "failed."; fi
+  return $retn;
+}
+
+spoof_dns(){ #$1: ssh_host $2:dns_spoofer $3:dns_spoof_exclude(optional)
+  local ssh_host="${1:-localhost}";
+  local dns_spoofer="${2:-none}"; [ "$dns_spoofer" = "none" ] && return 1;
+  local dns_spoof_exclude="$3"
+  local dnscfg="/etc/resolv.conf"
+  local dnsbak="/etc/resolv.conf.origin"
+  local ip=; local pe=; local cmd=; local retn=;
+  [ -z "$ssh_host" ] && return 1;
+  if [ -n "$dns_spoof_exclude" ]; then
+    cmd="for pe in $dns_spoof_exclude; do sed -i \"/\$pe/d\" /etc/hosts &>/dev/null; done;"
+    cmd="$cmd for pe in $dns_spoof_exclude; do ip=\$(dig +short \$pe 2>/dev/null);"
+    cmd="$cmd [ -n \"\$ip\" ] && echo \"\$ip \$pe\" >> /etc/hosts; done;";
+  fi
+  cmd="$cmd [ -f \"$dnsbak\" ] || cat $dnscfg > $dnsbak 2>/dev/null;"
+  cmd="$cmd echo nameserver $dns_spoofer > $dnscfg 2>/dev/null; echo \$?;";
+  echo -n "@$ssh_host: set spoofer ($dns_spoofer) as DNS name server ...... "
+  if [ "$ssh_host" = "localhost" ]; then retn=`eval "$cmd"`;
+    else retn=`ssh root@$ssh_host 2>/dev/null "$cmd"`; fi
+  if [ "X$retn" = "X0" ]; then echo "done."; else echo "failed."; fi
+  return $retn;
+}
+
+reset_dns(){ #$1:ssh_host $2:dns_spoofer $3:dns_spoof_exclude
+  local ssh_host="${1:-localhost}";
+  local dns_spoofer="${2:-none}"; [ "$dns_spoofer" = "none" ] && return 1;
+  local dns_spoof_exclude="$3"
+  local dnscfg="/etc/resolv.conf"
+  local dnsbak="/etc/resolv.conf.origin"
+  local ip=; local pe=; local cmd=; local retn=;
+  [ -z "$ssh_host" ] && return 1;
+  if [ -n "$dns_spoof_exclude" ]; then
+    cmd="for pe in $dns_spoof_exclude; do sed -i \"/\$pe/d\" /etc/hosts &>/dev/null; done;"
+  fi
+  cmd="$cmd [ -f \"$dnsbak\" ] && cat $dnsbak > $dnscfg 2>/dev/null; echo \$?;";
+  echo -n "@$ssh_host: remove DNS spoofing ...... "
+  if [ "$ssh_host" = "localhost" ]; then retn=`eval "$cmd"`;
+    else retn=`ssh root@$ssh_host 2>/dev/null "$cmd"`; fi
+  if [ "X$retn" = "X0" ]; then echo "done."; else echo "not spoofed."; fi
+  return $retn;
+}
+
+get_sim_threads(){ #$1:client_number (optional, will use single thread if not present)
+  local n_threads=`grep processor /proc/cpuinfo 2>/dev/null|wc -l`
+  local n_client=${1:-"1"}
+  ((n_threads>n_client)) && n_threads=$n_client
+  ((n_threads>1)) && echo "-t $n_threads"
+}
+
+edit_cl_conf(){ #$1:name $2:number $3:next_hop
+  local name="$1"; local num="$2"; local next_hop="$3";
+  local loading_if="$(get_loading_if $next_hop)";
+  local subnet="$(client_subnet_by_next_hop $loading_if $next_hop)"
+  local netmask="$(get_mask_part $subnet)"; 
+  subnet="$(get_net_part $subnet)";
+  local ipmin="$subnet.10"; [ "$netmask" = "16" ] && ipmin="$subnet.0.10";
+  local ipmax="$subnet.254"; [ "$netmask" = "16" ] && ipmax="$subnet.255.254";
+  local start=; local inc=; local ramp=100; #100 seconds
+  ((inc=num/ramp)); ((inc<1)) && inc=0; ((start=num-inc*ramp)); ((start<1)) && start=0;
+  [ -s "$name.conf" ] || cat_cl_conf "$name" "$num" "$loading_if" "$netmask" "$ipmin" "$ipmax" "$start" "$inc"
+  echo -e "$PWD/$name.conf:\n===================" && grep -v "^#" "$name.conf" && echo "==================="
+#  echo -n "Need to modify it? [Yes]|No: " && read;
+#  case "$REPLY" in Yes|yes|Y|y) vi $name.conf || return 1;; *) return 0;; esac
+}
+
+main_batch(){ #$1:test_name $2:client_number $3:client_next_hop $4:proxy[:port] $5:dns_spoofer 
+  local test_name="$1" 
+  local client_number="$2" 
+  local client_next_hop="$3"
+  local proxy_option="${4:-none}"
+  local dns_spoofer="${5:-none}"
+  local loading_if="$(get_loading_if $client_next_hop)";
+  local loading_ip="$(get_loading_ip $client_next_hop)"
+  local thread_option="$(get_sim_threads $client_number)"
+  local proxy_ip="${proxy_option%%:*}"; [ -n "$proxy_ip" ] || proxy_ip="none";
+  local proxy_port="`echo $4|awk -F: '{print $2}'`";
+  local rr_list=  # tell hosts in this list the Return Route to virtual client
+  local ds_list=  # tell hosts in this list to use Dns Spoofer as name server
+  local mode= ip_spoofing= en= retn=0;
+  [ "$dns_spoofer" = "localhost" ] && dns_spoofer="$loading_ip";
+  for en in client_next_hop loading_if loading_ip; do eval "echo \"$en=[\$$en]\"; [ -z \"\$$en\" ] && retn=1"; done
+  [ "$retn" = "1" ] && usage;
+
+  if [ "$proxy_ip" = "none" ]; then   # no proxy
+    proxy_option="" && proxy_ip="" && mode="non-proxy";
+    ds_list="localhost"
+    rr_list="$client_next_hop $iws_list";
+  elif [ -n "$proxy_port" ]; then     # explicit proxy
+    proxy_option="-x $proxy_ip:$proxy_port" && mode="explicit";
+    ds_list="$proxy_ip"
+    rr_list="$client_next_hop $proxy_ip"
+    ip_spoofing="$(get_wcg_config $proxy_ip 'ip_spoofing')"
+  elif [ "$client_next_hop" = "$proxy_ip" ]; then  # transparent proxy
+    proxy_option="" && mode="transparent"
+    ds_list="localhost $proxy_ip"
+    rr_list="$proxy_ip"
+    ip_spoofing="$(get_wcg_config $proxy_ip 'ip_spoofing')"
+  else
+    echo -e "Unknown mode: "
+    for en in proxy_ip proxy_port client_next_hop; do
+       eval "echo \"$en=[\$$en]\"; [ -z \"\$$en\" ] && retn=1";
+    done
+    usage; return 1;
+  fi
+  rr_list=`for i in $rr_list; do echo "$i"; done | sort | uniq`
+  ds_list=`for i in $ds_list; do echo $i; done | sort | uniq`
+  echo "Mode: $mode"
+
+  #Pre-check loading system
+  tune_loading_system "$loading_if" || return 1
+  install_curl_loader || return 1
+
+  #Create and modify curl-loader config file
+  edit_cl_conf "$test_name" "$client_number" "$client_next_hop"
+
+  #Setup route and dns spoofing
+  client_subnet="$(client_subnet_from_conf ${test_name}.conf || return 1)";
+  for en in $rr_list; do add_net_route "$en" "$client_subnet" "$loading_ip"; done # return route
+  [ "$mode" = "transparent" ] && for en in $iws_list; do add_host_route "localhost" "$en/32" "$proxy_ip"; done
+  [ "$ip_spoofing" = "1" ] && for en in $iws_list; do add_net_route "$en" "$client_subnet" "$proxy_ip"; done
+  for en in $ds_list; do spoof_dns "$en" "$dns_spoofer" "$dns_spoof_exclude"; done
+  [ "$dns_spoofer" != "none" ] && clear_wcg_cache "$proxy_ip";
+  
+  #Launch curl-loader
+  cmd="curl-loader -w -r -l 1024 -c 120 $proxy_option -f ${test_name}.conf $thread_option" && echo "run: $cmd"
+  read -p "Prress 'Enter' to start... " && $cmd
+  rm -rf "$test_name.conf" ${test_name}_*
+  echo
+
+  #Clear routes and dns spoofing
+  for en in $ds_list; do reset_dns "$en" "$dns_spoofer" "$dns_spoof_exclude"; done
+  for en in $rr_list; do del_net_route "$en" "$client_subnet" "$client_next_hop"; done
+  [ "$mode" = "transparent" ] && for en in $iws_list; do del_host_route "localhost" "$en/32" "$proxy_ip"; done
+  [ "$ip_spoofing" = "1" ] && for en in $iws_list; do del_net_route "$en" "$client_subnet" "$proxy_ip"; done
+}
+
+# Main Process
+case "$1" in
+ --help|-h) usage;;
+  set-sshd) until shift && [ -z "$1" ]; do sync_ssh_keys "$1"; done;;
+  set-bind) shift && setup_dns_spoofer $@;;
+  set-docs) shift && tgt="$1" && while shift && [ -d "$1" ]; do put_dir_to_apache "$tgt" "$1"; done;;
+  set-urls) shift && tgt="$1" && while shift && [ -n "$1" ]; do add_url_to_list "$tgt" "$1"; done;;
+         *) #[ "$#" = "5" ] || usage;
+            [ -s "$test_name.urls" ] || { echo "no URL found in file [$test_name.urls]"; exit 1; }
+            main_batch "$test_name" "$client_number" "$client_next_hop" "$proxy_option" "$dns_spoofer";;
+esac
